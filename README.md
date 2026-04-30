@@ -148,9 +148,9 @@ fileFilter: .cs
 ```text
 RimSearcher Architecture (Narrow)
 
-MCP Client 
+MCP Client
   |
-  | JSON-RPC (MCP)
+  | JSON-RPC over stdio or Streamable HTTP
   v
 RimSearcher.cs (runtime)
   |- request routing / concurrency / cancel / progress / logging bridge
@@ -186,7 +186,7 @@ Tool Layer
 4. 尝试加载索引缓存（`manifest.json` + `index.bin`）
 5. 缓存未命中时扫描 C# / XML 并建索引，然后回写缓存
 6. 冻结索引（读优化）
-7. 注册工具并启动 MCP 服务
+7. 注册工具并按 `--transport` 选择启动 stdio 或 Streamable HTTP 服务
 
 ---
 
@@ -315,6 +315,23 @@ Tool Layer
 - 修改客户端 MCP 配置后，重启客户端或重载 MCP 服务。
 - 若客户端有工具白名单/权限开关，确保已允许 `RimSearcher`。
 
+#### 共享本地 HTTP 服务（支持 URL 的客户端）
+
+默认 stdio 模式仍然兼容所有现有配置，但每个客户端会启动一个独立进程。若客户端支持 URL 形式的 MCP server，可以手动启动一次共享 HTTP 服务：
+
+```powershell
+$env:RIMSEARCHER_CONFIG="D:/your/custom/path/config.json"
+D:/Tools/RimSearcher/RimSearcher.Server.exe --transport streamable-http --host 127.0.0.1 --port 51234 --mount-path /mcp
+```
+
+然后把支持 URL 的客户端指向：
+
+```text
+http://127.0.0.1:51234/mcp
+```
+
+HTTP 模式默认只绑定 `127.0.0.1`，推荐仅用于本机共享。若手动改成 `0.0.0.0`，需要自行承担局域网暴露风险；本项目当前不提供远程认证或授权机制。
+
 ### 本地验证
 手动验证时：
 - 方式 A：设置环境变量 `RIMSEARCHER_CONFIG` 指向目标 `config.json`。
@@ -332,6 +349,14 @@ Tool Layer
 快速检查是否接入成功：
 - 客户端工具列表中能看到 `rimworld-searcher__locate`、`rimworld-searcher__inspect` 等 6 个工具。
 - 执行一次 `locate`（例如 `def:Apparel_ShieldBelt`）能返回结果。
+
+HTTP 模式验证时，先启动：
+
+```powershell
+RimSearcher.Server.exe --transport streamable-http --host 127.0.0.1 --port 51234 --mount-path /mcp
+```
+
+再用支持 URL 的 MCP 客户端连接 `http://127.0.0.1:51234/mcp`，执行一次 `tools/list` 或 `locate` 即可确认共享服务可用。
 
 ---
 
