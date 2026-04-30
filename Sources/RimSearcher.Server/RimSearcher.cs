@@ -9,21 +9,36 @@ public sealed class RimSearcher
     private readonly Dictionary<string, ITool> _tools = new();
     private readonly ConcurrentDictionary<string, CancellationTokenSource> _activeRequests = new();
     private readonly SemaphoreSlim _writeLock = new(1, 1);
-    private readonly TextWriter _protocolOut;
-    
+    private readonly IJsonRpcOutput _defaultOutput;
+
     private readonly SemaphoreSlim _concurrencyLimit = new(10, 10);
 
-    public RimSearcher(TextWriter? protocolOut = null)
+    public RimSearcher(TextWriter? protocolOut = null, bool emitLogNotifications = true)
     {
-        _protocolOut = protocolOut ?? Console.Out;
-        ServerLogger.OnLogAsync = (msg, level) => this.LogAsync(msg, level);
+        _defaultOutput = new TextWriterJsonRpcOutput(protocolOut ?? Console.Out, _writeLock);
+
+        if (emitLogNotifications)
+        {
+            ServerLogger.OnLogAsync = (msg, level) => LogAsync(msg, level);
+        }
+        else
+        {
+            ServerLogger.UseConsoleLogging();
+        }
     }
-    
+
     public void RegisterTool(ITool tool)
     {
         _tools[tool.Name] = tool;
     }
-    
+
+    public async Task<IReadOnlyList<string>> HandleMessageAsync(string line, CancellationToken cancellationToken = default)
+    {
+        var output = new BufferedJsonRpcOutput();
+        await ProcessMessageAsync(line, output, cancellationToken);
+        return output.Messages;
+    }
+
     public async Task RunAsync()
     {
         while (true)
@@ -31,83 +46,92 @@ public sealed class RimSearcher
             var line = await Console.In.ReadLineAsync();
             if (line == null) break;
 
-            await _concurrencyLimit.WaitAsync();
-
-            _ = Task.Run(async () =>
-            {
-                object? requestId = null;
-                string? requestKey = null;
-                CancellationTokenSource? cts = null;
-
-                try
-                {
-                    using var doc = JsonDocument.Parse(line);
-                    var root = doc.RootElement;
-
-                    if (!root.TryGetProperty("method", out var methodProp))
-                    {
-                        if (root.TryGetProperty("id", out var errId))
-                            await SendResponseAsync(errId, error: new { code = -32600, message = "Invalid Request" });
-                        return;
-                    }
-
-                    var method = methodProp.GetString();
-                    
-                    if (method == "$.cancelRequest")
-                    {
-                        if (root.TryGetProperty("params", out var p) && p.TryGetProperty("id", out var cancelId))
-                        {
-                            var idToCancel = cancelId.ToString(); 
-                            if (_activeRequests.TryRemove(idToCancel, out var targetCts))
-                            {
-                                targetCts.Cancel();
-                            }
-                        }
-                        return;
-                    }
-
-                    bool hasId = root.TryGetProperty("id", out var idProp);
-                    if (hasId)
-                    {
-                        requestId = idProp; 
-                        requestKey = idProp.ToString(); 
-                        cts = new CancellationTokenSource();
-                        _activeRequests[requestKey] = cts;
-                    }
-
-                    await HandleRequestAsync(method, requestId, root, cts?.Token ?? CancellationToken.None);
-                }
-                catch (JsonException)
-                {
-                    await SendResponseAsync(null, error: new { code = -32700, message = "Parse error" });
-                }
-                catch (OperationCanceledException)
-                {
-                    if (requestId != null)
-                        await SendResponseAsync(requestId, error: new { code = -32000, message = "Request cancelled" });
-                }
-                catch (Exception ex)
-                {
-                    if (requestId != null)
-                        await SendResponseAsync(requestId, error: new { code = -32603, message = $"Internal error: {ex.Message}" });
-                }
-                finally
-                {
-                    if (requestKey != null) _activeRequests.TryRemove(requestKey, out _);
-                    cts?.Dispose();
-                    _concurrencyLimit.Release();
-                }
-            });
+            _ = Task.Run(() => ProcessMessageAsync(line, _defaultOutput, CancellationToken.None));
         }
     }
 
-    private async Task HandleRequestAsync(string? method, object? id, JsonElement root, CancellationToken ct)
+    private async Task ProcessMessageAsync(string line, IJsonRpcOutput output, CancellationToken cancellationToken)
+    {
+        await _concurrencyLimit.WaitAsync(cancellationToken);
+
+        object? requestId = null;
+        string? requestKey = null;
+        CancellationTokenSource? cts = null;
+
+        try
+        {
+            using var doc = JsonDocument.Parse(line);
+            var root = doc.RootElement;
+
+            if (!root.TryGetProperty("method", out var methodProp))
+            {
+                if (root.TryGetProperty("result", out _) || root.TryGetProperty("error", out _))
+                {
+                    return;
+                }
+
+                if (root.TryGetProperty("id", out var errId))
+                    await SendResponseAsync(output, errId, error: new { code = -32600, message = "Invalid Request" });
+                return;
+            }
+
+            var method = methodProp.GetString();
+
+            if (method == "$.cancelRequest")
+            {
+                if (root.TryGetProperty("params", out var p) && p.TryGetProperty("id", out var cancelId))
+                {
+                    var idToCancel = cancelId.ToString();
+                    if (_activeRequests.TryRemove(idToCancel, out var targetCts))
+                    {
+                        targetCts.Cancel();
+                    }
+                }
+                return;
+            }
+
+            var requestToken = cancellationToken;
+            bool hasId = root.TryGetProperty("id", out var idProp);
+            if (hasId)
+            {
+                requestId = idProp;
+                requestKey = idProp.ToString();
+                cts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+                requestToken = cts.Token;
+                _activeRequests[requestKey] = cts;
+            }
+
+            await HandleRequestAsync(output, method, requestId, root, requestToken);
+        }
+        catch (JsonException)
+        {
+            await SendResponseAsync(output, null, error: new { code = -32700, message = "Parse error" });
+        }
+        catch (OperationCanceledException)
+        {
+            if (requestId != null)
+                await SendResponseAsync(output, requestId, error: new { code = -32000, message = "Request cancelled" });
+        }
+        catch (Exception ex)
+        {
+            if (requestId != null)
+                await SendResponseAsync(output, requestId, error: new { code = -32603, message = $"Internal error: {ex.Message}" });
+        }
+        finally
+        {
+            if (requestKey != null) _activeRequests.TryRemove(requestKey, out _);
+            cts?.Dispose();
+            _concurrencyLimit.Release();
+        }
+    }
+
+    private async Task HandleRequestAsync(IJsonRpcOutput output, string? method, object? id, JsonElement root, CancellationToken ct)
     {
         try
         {
             if (method == "initialize")
             {
-                await SendResponseAsync(id, new
+                await SendResponseAsync(output, id, new
                 {
                     protocolVersion = "2025-11-25",
                     capabilities = new
@@ -126,12 +150,12 @@ public sealed class RimSearcher
             }
             else if (method == "notifications/initialized")
             {
-                await LogAsync("RimSearcher: Server initialized and ready to handle requests.", "info");
+                await SendLogNotificationAsync(output, "RimSearcher: Server initialized and ready to handle requests.", "info");
             }
             else if (method == "list_tools" || method == "tools/list")
             {
                 if (id == null) return;
-                await SendResponseAsync(id, new
+                await SendResponseAsync(output, id, new
                 {
                     tools = _tools.Values.Select(t => new
                     {
@@ -149,19 +173,19 @@ public sealed class RimSearcher
 
                 if (toolName != null && _tools.TryGetValue(toolName, out var tool))
                 {
-                  
-                    var progressReporter = new Progress<double>(async p => 
+
+                    var progressReporter = new Progress<double>(async p =>
                     {
-                        await SendNotificationAsync("notifications/progress", new 
+                        await SendNotificationAsync(output, "notifications/progress", new
                         {
                             progress = p,
                             total = 1.0,
-                            progressToken = id 
+                            progressToken = id
                         });
                     });
 
                     var result = await tool.ExecuteAsync(paramsElem.GetProperty("arguments"), ct, progressReporter);
-                    await SendResponseAsync(id, new
+                    await SendResponseAsync(output, id, new
                     {
                         content = new[] { new { type = "text", text = result.Content } },
                         isError = result.IsError
@@ -169,7 +193,7 @@ public sealed class RimSearcher
                 }
                 else
                 {
-                    await SendResponseAsync(id, error: new { code = -32601, message = "Tool not found" });
+                    await SendResponseAsync(output, id, error: new { code = -32601, message = "Tool not found" });
                 }
             }
         }
@@ -177,12 +201,20 @@ public sealed class RimSearcher
         catch (Exception ex)
         {
             if (id != null)
-                await SendResponseAsync(id, error: new { code = -32603, message = $"Internal error: {ex.Message}" });
+                await SendResponseAsync(output, id, error: new { code = -32603, message = $"Internal error: {ex.Message}" });
         }
     }
 
-    
     public async Task LogAsync(string message, string level = "info", string? logger = "RimSearcher")
+    {
+        await SendLogNotificationAsync(_defaultOutput, message, level, logger);
+    }
+
+    private async Task SendLogNotificationAsync(
+        IJsonRpcOutput output,
+        string message,
+        string level = "info",
+        string? logger = "RimSearcher")
     {
         if (string.Equals(logger, "RimSearcher", StringComparison.Ordinal) && TrySplitComponentMessage(message, out var component, out var normalizedMessage))
         {
@@ -190,7 +222,7 @@ public sealed class RimSearcher
             message = normalizedMessage;
         }
 
-        await SendNotificationAsync("notifications/logging/message", new
+        await SendNotificationAsync(output, "notifications/logging/message", new
         {
             level = level,
             logger = logger,
@@ -220,24 +252,14 @@ public sealed class RimSearcher
         return true;
     }
 
-    private async Task SendNotificationAsync(string method, object? @params = null)
+    private static async Task SendNotificationAsync(IJsonRpcOutput output, string method, object? @params = null)
     {
         var notification = new { jsonrpc = "2.0", method = method, @params = @params };
         var json = JsonSerializer.Serialize(notification);
-
-        await _writeLock.WaitAsync();
-        try
-        {
-            await _protocolOut.WriteLineAsync(json);
-            await _protocolOut.FlushAsync();
-        }
-        finally
-        {
-            _writeLock.Release();
-        }
+        await output.WriteLineAsync(json);
     }
 
-    private async Task SendResponseAsync(object? id, object? result = null, object? error = null)
+    private static async Task SendResponseAsync(IJsonRpcOutput output, object? id, object? result = null, object? error = null)
     {
         if (id == null && error == null) return;
 
@@ -246,16 +268,6 @@ public sealed class RimSearcher
             : new { jsonrpc = "2.0", id = id, result = result };
 
         var json = JsonSerializer.Serialize(response);
-
-        await _writeLock.WaitAsync();
-        try
-        {
-            await _protocolOut.WriteLineAsync(json);
-            await _protocolOut.FlushAsync();
-        }
-        finally
-        {
-            _writeLock.Release();
-        }
+        await output.WriteLineAsync(json);
     }
 }

@@ -4,6 +4,11 @@ public static class ServerLogger
 {
     public static Func<string, string, Task>? OnLogAsync;
 
+    public static void UseConsoleLogging()
+    {
+        OnLogAsync = WriteConsoleAsync;
+    }
+
     public static async Task LogAsync(string message, string level = "info")
     {
         if (OnLogAsync != null)
@@ -12,7 +17,7 @@ public static class ServerLogger
         }
         else
         {
-            await Console.Error.WriteLineAsync($"[{level.ToUpper()}] {message}");
+            await WriteConsoleAsync(message, level);
         }
     }
 
@@ -24,6 +29,11 @@ public static class ServerLogger
 
     public static async Task Error(string component, string message, params (string Key, object? Value)[] fields)
         => await LogAsync(Format(component, message, fields), "error");
+
+    private static Task WriteConsoleAsync(string message, string level)
+    {
+        return Console.Error.WriteLineAsync($"[{level.ToUpperInvariant()}] {message}");
+    }
 
     private static string Format(string component, string message, (string Key, object? Value)[] fields)
     {
