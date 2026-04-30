@@ -7,7 +7,11 @@ using RimSearcher.Server;
 Console.InputEncoding = Encoding.UTF8;
 Console.OutputEncoding = Encoding.UTF8;
 
-var protocolOut = Console.Out;
+var cliOptions = ServerCliOptions.Parse(args);
+
+var protocolOut = cliOptions.Transport == McpTransportKind.Stdio
+    ? Console.Out
+    : TextWriter.Null;
 Console.SetOut(Console.Error);
 
 var (appConfig, configPath, isLoaded) = AppConfig.Load();
@@ -142,7 +146,9 @@ if (failedPaths.Count > 0)
     await ServerLogger.Warning("Program", "Some configured paths are unavailable", ("count", failedPaths.Count), ("paths", string.Join("; ", failedPaths)));
 }
 
-var server = new RimSearcher.Server.RimSearcher(protocolOut);
+var server = new RimSearcher.Server.RimSearcher(
+    protocolOut,
+    emitLogNotifications: cliOptions.Transport == McpTransportKind.Stdio);
 
 server.RegisterTool(new ListDirectoryTool());
 server.RegisterTool(new LocateTool(indexer, defIndexer));
@@ -156,9 +162,24 @@ if (isLoaded && hasPaths)
     await ServerLogger.Info("Program", "RimSearcher MCP server started");
 }
 
+if (cliOptions.Transport == McpTransportKind.StreamableHttp)
+{
+    await ServerLogger.Info(
+        "Program",
+        "Streamable HTTP endpoint configured",
+        ("url", $"http://{cliOptions.Host}:{cliOptions.Port}{cliOptions.MountPath}"));
+}
+
 if (appConfig.CheckUpdates)
 {
     _ = Task.Run(UpdateChecker.CheckAsync);
 }
 
-await server.RunAsync();
+if (cliOptions.Transport == McpTransportKind.StreamableHttp)
+{
+    await McpHttpHost.RunAsync(server, cliOptions);
+}
+else
+{
+    await server.RunAsync();
+}
