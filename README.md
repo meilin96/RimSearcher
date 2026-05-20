@@ -146,19 +146,26 @@ fileFilter: .cs
 ## 2.5 系统架构
 
 ```text
-RimSearcher Architecture (Narrow)
+RimSearcher Architecture
 
 MCP Client
   |
   | JSON-RPC over stdio or Streamable HTTP
   v
+Transport Layer
+  |- Stdio: TextWriterJsonRpcOutput -> Console.Out
+  |- HTTP:  McpHttpHost -> BufferedJsonRpcOutput -> HTTP Response
+  |- ServerCliOptions: --transport, --host, --port, --mount-path
+  v
 RimSearcher.cs (runtime)
   |- request routing / concurrency / cancel / progress / logging bridge
+  |- IJsonRpcOutput: abstract transport from protocol handling
   v
 Program.cs (bootstrap)
+  |- parse CLI options (ServerCliOptions)
   |- load config + PathSecurity
   |- try cache -> fallback full scan -> save cache
-  |- start MCP server
+  |- select transport and start MCP server
   |
   +-- IndexCacheService
   |     |- .cache/index/manifest.json
@@ -223,7 +230,48 @@ Tool Layer
 
 ---
 
-## 5. 快速开始
+## 5. 传输模式
+
+RimSearcher 支持两种 MCP 传输模式，通过 `--transport` 参数选择：
+
+| 模式 | 参数值 | 适用场景 | 进程模型 |
+|------|--------|----------|----------|
+| **Stdio** | `stdio`（默认） | 单客户端、本地开发 | 每个客户端独立启动进程 |
+| **Streamable HTTP** | `streamable-http` | 多客户端共享、远程访问 | 单进程托管 HTTP 端点 |
+
+### Stdio 模式（默认）
+- 通过标准输入/输出与 MCP 客户端通信
+- JSON-RPC 输出直接写入 stdout，日志重定向到 stderr
+- 无需额外配置即可工作
+
+### Streamable HTTP 模式
+- 将 MCP 服务暴露为 HTTP 端点，支持多个客户端同时连接
+- JSON-RPC 输出缓冲到内存后通过 HTTP 响应返回
+- 仅允许 localhost / 回环地址连接（安全策略）
+- 不支持客户端传入 `Origin` 头与 GET 请求
+
+### CLI 选项
+
+| 选项 | 默认值 | 说明 |
+|------|--------|------|
+| `--transport` | `stdio` | 传输模式：`stdio` 或 `streamable-http` |
+| `--host` | `127.0.0.1` | HTTP 模式监听地址 |
+| `--port` | `51234` | HTTP 模式监听端口（1-65535） |
+| `--mount-path` | `/mcp` | HTTP 端点挂载路径 |
+
+支持 `--key=value` 和 `--key value` 两种格式：
+
+```powershell
+# Streamable HTTP 模式（等号格式）
+RimSearcher.Server.exe --transport=streamable-http --host=127.0.0.1 --port=51234 --mount-path=/mcp
+
+# Stdio 模式（默认，可省略 --transport）
+RimSearcher.Server.exe
+```
+
+---
+
+## 6. 快速开始
 
 ### 前置要求
 > 运行 Release 版 `RimSearcher.Server.exe` 需要 [.NET 10 Runtime](https://dotnet.microsoft.com/download/dotnet/10.0)；
@@ -360,7 +408,7 @@ RimSearcher.Server.exe --transport streamable-http --host 127.0.0.1 --port 51234
 
 ---
 
-## 6. 更新提示说明
+## 7. 更新提示说明
 
 - 更新检查为非阻塞后台任务，不影响核心检索服务。
 - 仅在 `CheckUpdates=true` 时启用。
